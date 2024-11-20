@@ -77,19 +77,15 @@ DEFAULT_TOKEN_NAME = "LEGENDARY HUMANITY"
 DEFAULT_TOKEN_DESCRIPTION = "Merging fashion, art, and #AI into #Web3 assets. Empowering designers and artists with community-driven #meme coins. $VIVI is the governance token."
 DEFAULT_IMAGE_DESCRIPTION = "A vibrant and humorous illustration representing the essence of the tweet, with logo 'LEGENDARY HUMANITY' and 'VIVI'."
 
-# 文件路径
-TOKEN_FILE = 'twitter_tokens.json'
+# 保存 tokens 到本地存储
+def save_tokens_to_local_storage(tokens: Dict[str, str]) -> None:
+    st.experimental_set_query_params(**tokens)
 
-# 保存 tokens 到文件
-def save_tokens(tokens: Dict[str, str], file_path: str) -> None:
-    with open(file_path, 'w') as f:
-        json.dump(tokens, f)
-
-# 从文件加载 tokens
-def load_tokens(file_path: str) -> Optional[Dict[str, str]]:
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as f:
-            return json.load(f)
+# 从本地存储加载 tokens
+def load_tokens_from_local_storage() -> Optional[Dict[str, str]]:
+    params = st.experimental_get_query_params()
+    if params:
+        return {key: params[key][0] for key in params}
     return None
 
 # 认证函数
@@ -108,7 +104,7 @@ def authenticate_twitter(credentials: Dict[str, str]) -> Optional[tweepy.Client]
         return None
 
 # 加载现有 tokens
-tokens = load_tokens(TOKEN_FILE)
+tokens = load_tokens_from_local_storage()
 
 if tokens:
     client = authenticate_twitter(tokens)
@@ -135,7 +131,7 @@ else:
         }
         client = authenticate_twitter(credentials)
         if client:
-            save_tokens(credentials, TOKEN_FILE)
+            save_tokens_to_local_storage(credentials)
             st.success("Authenticated successfully and tokens saved!")
         else:
             st.error("Failed to authenticate with Twitter.")
@@ -162,7 +158,7 @@ if 'switch_account' in st.session_state and st.session_state.switch_account:
         }
         client = authenticate_twitter(credentials)
         if client:
-            save_tokens(credentials, TOKEN_FILE)
+            save_tokens_to_local_storage(credentials)
             st.success("Authenticated successfully and tokens saved!")
             st.session_state.switch_account = False
         else:
