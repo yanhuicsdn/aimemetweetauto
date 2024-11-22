@@ -4,78 +4,332 @@ import streamlit as st
 import re
 import json
 import os
-import tweepy
 from typing import List, Dict, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential
+import time
+import tweepy
 from datetime import datetime
 
-# 默认配置
-DEFAULT_PROMPT = """
-Creative Meme Coin Content Creator
-Turn your meme coin into the next viral sensation! Let's create engaging content that captures the community's attention.
-
-First, analyze all the trending topics and select the most suitable one for the meme coin by considering:
-1. Relevance to crypto/blockchain/technology
-2. Potential for creative connection with the token's theme
-3. Current popularity and engagement potential
-
-Selected trend: {selected_trend}
-
-Content Generation Parameters
-{context_info}
-Token Details
-
-Name: {token_name}
-Description: {token_description}
-
-Content Style Guide
-
-Language: English/Chinese (as specified)
-Tone: Casual, clever, community-focused
-Format: Optimized for Twitter
-Elements: Text + Emojis + Hashtags
-
-Content Strategy
-
-Engaging Hook
-- Attention-grabbing opener
-- Relate to current trends
-- Use compelling language
-
-Core Message
-- Highlight unique features
-- Connect with community
-- Include meme references
-
-Viral Elements
-- Strategic emoji placement
-- Trending hashtag integration
-- Call-to-action
-
-Community Focus
-- Foster engagement
-- Encourage sharing
-- Build connections
-
-Output Format
-Tweet format should follow:
-[Hook] + [Core Message] + [Community Element] + [Call to Action] + [Trending Tags]
-
-Content Requirements
-- Keep it fun and shareable
-- Blend humor with value
-- Stay relevant to trends
-- Encourage interaction
-- Maintain brand voice
-
-Ready to create your next viral tweet! 🚀
-
-Note: Each piece of content will be uniquely crafted based on the provided parameters while maintaining optimal engagement potential.
-Using the above guidelines and context, create a creative and engaging tweet for the meme coin "{token_name}" based on its description: "{token_description}". Ensure that the tweet content is strongly related to the selected trending hashtag to maximize engagement.
-"""
-
+# Constants
 DEFAULT_TOKEN_NAME = "LEGENDARY HUMANITY"
 DEFAULT_TOKEN_DESCRIPTION = "Merging fashion, art, and #AI into #Web3 assets. Empowering designers and artists with community-driven #meme coins. $VIVI is the governance token."
 DEFAULT_IMAGE_DESCRIPTION = "A vibrant and humorous illustration representing the essence of the tweet, with logo 'LEGENDARY HUMANITY' and 'VIVI'."
+
+# Retry decorator for API calls
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def api_call_with_retry(func, *args, **kwargs):
+    return func(*args, **kwargs)
+
+def rag_search(trend: str) -> str:
+    """
+    获取趋势的上下文信息
+    """
+    url = "https://api.siliconflow.cn/v1/chat/completions"
+    headers = {
+        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""
+    Analyze this trend "{trend}" and provide:
+    1. What is this trend about?
+    2. Why is it trending?
+    3. Current sentiment around it
+
+    Keep response brief and focused on viral/meme potential.
+    """
+
+    payload = {
+        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 200
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        content = response.json()['choices'][0]['message']['content']
+        return content
+    except Exception as e:
+        st.error(f"RAG Search Error: {str(e)}")
+        return ""
+
+def preprocess_trends(trends: List[str]) -> List[Dict]:
+    """
+    预处理趋势数据，添加元数据
+    """
+    processed = []
+    seen = set()
+
+    for trend in trends:
+        # 清理并提取数据
+        match = re.match(r'^(.*?)(?:\s+(\d+)([KM])?)?$', trend)
+        if match:
+            name, count, unit = match.groups()
+
+            # 标准化名称
+            clean_name = name.strip()
+            if clean_name.lower() in seen:
+                continue
+
+            # 计算实际数量
+            engagement = 0
+            if count:
+                count = int(count)
+                if unit == 'K':
+                    engagement = count * 1000
+                elif unit == 'M':
+                    engagement = count * 1000000
+                else:
+                    engagement = count
+
+            processed.append({
+                'name': clean_name,
+                'original': trend,
+                'engagement': engagement,
+                'is_hashtag': clean_name.startswith('#'),
+            })
+            seen.add(clean_name.lower())
+
+    return processed
+
+def score_trend(trend: Dict, token_name: str, token_description: str) -> float:
+    """
+    对趋势进行评分
+    """
+    score = 0
+
+    # 参与度分数 (0-0.3)
+    if trend['engagement'] > 500000:
+        score += 0.3
+    elif trend['engagement'] > 100000:
+        score += 0.2
+    elif trend['engagement'] > 10000:
+        score += 0.1
+
+    # 相关性分数 (0-0.3)
+    relevant_keywords = ['crypto', 'nft', 'web3', 'ai', 'tech', 'digital', 'art', 'game']
+    trend_text = f"{trend['name']} {token_name} {token_description}".lower()
+    relevance = sum(1 for keyword in relevant_keywords if keyword in trend_text)
+    score += min(0.3, relevance * 0.1)
+
+    # 话题类型分数 (0-0.2)
+    if trend['is_hashtag']:
+        score += 0.1
+    if len(trend['name'].split()) <= 3:  # 简短话题更容易传播
+        score += 0.1
+
+    # 多样性分数 (0-0.2)
+    if bool(re.search(r'[^a-zA-Z0-9\s]', trend['name'])):  # 包含特殊字符
+        score += 0.1
+    if any(char.isupper() for char in trend['name']):  # 包含大写字母
+        score += 0.1
+
+    return score
+
+def get_latest_global_trends() -> List[Dict]:
+    """
+    获取最新趋势并预处理
+    """
+    url = "https://trends24.in/united-states/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        trends_list = []
+        trend_cards = soup.find_all('ol', class_='trend-card__list')
+
+        for card in trend_cards[:3]:  # 只取前3个时段的数据
+            trends = card.find_all('li')
+            for trend in trends:
+                trends_list.append(trend.get_text(strip=True))
+
+        return preprocess_trends(trends_list)
+    except Exception as e:
+        st.error(f"Error fetching trends: {str(e)}")
+        return []
+
+def select_best_trend(trends: List[Dict], token_name: str, token_description: str) -> tuple[str, str, str]:
+    """
+    选择最佳趋势并提供解释
+    返回: (trend_name, explanation, context)
+    """
+    # 给每个趋势评分
+    scored_trends = [(trend, score_trend(trend, token_name, token_description))
+                    for trend in trends]
+    # 排序并选择前3个
+    top_trends = sorted(scored_trends, key=lambda x: x[1], reverse=True)[:3]
+
+    # 让AI从前3个中选择
+    selection_prompt = f"""
+    Analyze these trending topics for a crypto meme token and return the analysis in JSON format:
+    {[t[0]['original'] for t in top_trends]}
+
+    Token: {token_name}
+    Description: {token_description}
+
+    Select the best trend considering:
+    1. Viral potential and engagement
+    2. Creative connection possibilities
+    3. Meme creation potential
+    4. Community engagement angle
+
+    Format your response EXACTLY like this:
+    {{
+        "selected_trend": "chosen trend name",
+        "explanation": "2-3 sentences explaining why this trend is perfect",
+        "usage_angle": "specific idea how to use this trend"
+    }}
+
+    Important: Return ONLY the JSON, no additional text.
+    """
+
+    url = "https://api.siliconflow.cn/v1/chat/completions"
+    headers = {
+        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "messages": [{"role": "user", "content": selection_prompt}],
+        "temperature": 0.7,
+        "max_tokens": 300
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        ai_response = response.json()['choices'][0]['message']['content'].strip()
+
+        # 清理响应文本，确保它是有效的JSON
+        ai_response = ai_response.replace('\n', ' ').strip()
+        if ai_response.startswith("```json"):
+            ai_response = ai_response[7:]
+        if ai_response.endswith("```"):
+            ai_response = ai_response[:-3]
+        ai_response = ai_response.strip()
+
+        try:
+            result = json.loads(ai_response)
+        except json.JSONDecodeError:
+            # 如果JSON解析失败，使用正则表达式提取信息
+            import re
+            selected_trend = re.search(r'"selected_trend"\s*:\s*"([^"]+)"', ai_response)
+            explanation = re.search(r'"explanation"\s*:\s*"([^"]+)"', ai_response)
+            usage_angle = re.search(r'"usage_angle"\s*:\s*"([^"]+)"', ai_response)
+
+            result = {
+                "selected_trend": selected_trend.group(1) if selected_trend else top_trends[0][0]['original'],
+                "explanation": explanation.group(1) if explanation else "Top trending topic with high engagement potential.",
+                "usage_angle": usage_angle.group(1) if usage_angle else "Leverage the trend's popularity for viral content."
+            }
+
+        # 获取选中趋势的上下文
+        context = rag_search(result['selected_trend'])
+
+        return (
+            result['selected_trend'],
+            result['explanation'],
+            f"{result['usage_angle']}\n\nTrend Context: {context}"
+        )
+    except Exception as e:
+        st.error(f"Trend Selection Error: {str(e)}")
+        # 发生错误时返回分数最高的趋势
+        return (
+            top_trends[0][0]['original'],
+            "Using highest scored trend for maximum engagement potential.",
+            "Leveraging trending topic for viral content creation."
+        )
+
+def generate_meme_tweet(token_name: str, token_description: str,
+                       trend: str, context: str) -> str:
+    """
+    生成meme tweet
+    """
+    prompt = f"""
+    Create a viral crypto meme tweet that perfectly blends the trend with our token!
+
+    Trend: {trend}
+    Context: {context}
+
+    Token: {token_name}
+    Description: {token_description}
+
+    Requirements:
+    1. Under 280 characters
+    2. Include 2-3 relevant emojis
+    3. Creative connection to the trend
+    4. Memorable hook or punchline
+    5. Call-to-action
+    6. 2-3 hashtags (including trend if relevant)
+
+    Make it catchy, humorous, and shareable!
+    Return the tweet text only, no explanations.
+    """
+
+    url = "https://api.siliconflow.cn/v1/chat/completions"
+    headers = {
+        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.8,
+        "max_tokens": 200
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        tweet = response.json()['choices'][0]['message']['content']
+        return tweet.strip()
+    except Exception as e:
+        st.error(f"Tweet Generation Error: {str(e)}")
+        return None
+
+def generate_image(tweet_text: str, image_description: str) -> str:
+    """
+    基于tweet生成配图
+    """
+    prompt = f"""
+    Create a meme image based on this tweet:
+    {tweet_text}
+
+    Image requirements:
+    {image_description}
+
+    Style: Meme-worthy, eye-catching, humorous
+    Include: Token branding elements
+    Mood: Viral and shareable
+    """
+
+    url = 'https://api.siliconflow.cn/v1/image/generations'
+    headers = {
+        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "black-forest-labs/FLUX.1-schnell",
+        "prompt": prompt,
+        "image_size": "1024x1024",
+        "seed": int(time.time()) % 1000000  # 动态种子
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()['images'][0]['url']
+    except Exception as e:
+        st.error(f"Image Generation Error: {str(e)}")
+        return None
 
 # Save tokens to local storage
 def save_tokens_to_local_storage(tokens: Dict[str, str]) -> None:
@@ -193,350 +447,98 @@ def post_tweet(client: tweepy.Client, content: str) -> None:
 def handle_tweet_button():
     st.session_state.show_tweet_button = True
 
-def rag_search(keywords: List[str]) -> str:
-    """
-    Perform RAG search for given keywords and return relevant content.
-    """
-    url = "https://google.serper.dev/search"
-    query = " ".join(keywords)
-
-    headers = {
-        'X-API-KEY': '0cadc0b6ceff6e6f6eebecf2e4c924de082e3616',
-        'Content-Type': 'application/json'
-    }
-
-    payload = json.dumps({"q": query})
-
-    try:
-        response = requests.post(url, headers=headers, data=payload)
-        response.raise_for_status()
-        results = response.json().get('organic', [])
-
-        content = []
-        for result in results[:5]:
-            snippet = result.get('snippet', '')
-            if snippet:
-                content.append(snippet)
-
-        return " ".join(content)
-    except Exception as e:
-        st.error(f"RAG Search Error: {str(e)}")
-        return ""
-
-def get_latest_global_trends():
-    url = "https://trends24.in/united-states/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        trend_cards = soup.find_all('ol', class_='trend-card__list')
-        trends_list = []
-        count = 0
-
-        for card in trend_cards:
-            trends = card.find_all('li')
-            for trend in trends:
-                if count >= 30:
-                    break
-                trend_text = trend.get_text(strip=True)
-                trend_name = re.sub(r'\s*\d+[KM]$', '', trend_text)
-                trends_list.append(trend_name)
-                count += 1
-            if count >= 30:
-                break
-
-        return trends_list
-    except Exception as e:
-        st.error(f"Error fetching trends: {str(e)}")
-        return []
-
-def select_best_trend(trends: List[str], token_name: str, token_description: str) -> tuple[str, str]:
-    """
-    让AI从趋势列表中选择最适合的一个，并解释选择原因
-    返回: (selected_trend, explanation)
-    """
-    url = "https://api.siliconflow.cn/v1/chat/completions"
-    headers = {
-        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
-        "Content-Type": "application/json"
-    }
-
-    selection_prompt = f"""
-    Given these trending topics:
-    {', '.join(trends)}
-
-    And this meme token information:
-    Token Name: {token_name}
-    Token Description: {token_description}
-
-    1. Select the single most suitable trending topic for creating a viral meme tweet.
-    2. Explain why this trend is the best choice in 2-3 sentences.
-
-    Format your response as JSON with two fields:
-    {{
-        "selected_trend": "the selected trend",
-        "explanation": "your explanation"
-    }}
-    """
-
-    payload = {
-        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "messages": [{"role": "user", "content": selection_prompt}],
-        "stream": False,
-        "max_tokens": 200,
-        "temperature": 0.9,
-        "response_format": {"type": "text"}
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        result = json.loads(data['choices'][0]['message']['content'])
-        return result["selected_trend"], result["explanation"]
-    except Exception as e:
-        st.error(f"Trend Selection Error: {str(e)}")
-        return trends[0] if trends else "", "Error occurred during selection explanation"
-
-def generate_meme_tweet(token_name, token_description, trends, prompt):
-    # 选择最佳趋势并获取解释
-    selected_trend, trend_explanation = select_best_trend(trends, token_name, token_description)
-
-    # 存储到 session state 中以供显示
-    st.session_state['selected_trend'] = selected_trend
-    st.session_state['trend_explanation'] = trend_explanation
-
-    # 获取趋势相关上下文
-    trend_context = rag_search([selected_trend])
-
-    # 组合趋势标签
-    selected_hashtag = f"#{selected_trend}"
-    context_info = f"Current Trend Context:\n{trend_context}"
-
-    formatted_prompt = prompt.format(
-        token_name=token_name,
-        token_description=token_description,
-        selected_trend=selected_trend,
-        context_info=context_info
-    )
-
-    url = "https://api.siliconflow.cn/v1/chat/completions"
-    headers = {
-        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "messages": [{"role": "user", "content": formatted_prompt}],
-        "stream": False,
-        "max_tokens": 512,
-        "stop": ["<string>"],
-        "temperature": 0.9,
-        "top_p": 0.7,
-        "top_k": 50,
-        "frequency_penalty": 0.5,
-        "n": 1,
-        "response_format": {"type": "text"}
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        tweet_content = data['choices'][0]['message']['content']
-        return tweet_content.strip()
-    except Exception as e:
-        st.error(f"Tweet Generation Error: {str(e)}")
-        return None
-
-def generate_image_from_text(image_prompt):
-    url = 'https://api.siliconflow.cn/v1/image/generations'
-    headers = {
-        "Authorization": "Bearer sk-ydcvskcyyzictsylxplbpqmqlpillcpkqznxclfjyohkefwt",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "black-forest-labs/FLUX.1-schnell",
-        "prompt": image_prompt,
-        "image_size": "1024x1024",
-        "seed": 4999999999
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        result = response.json()
-        return result['images'][0]['url']
-    except Exception as e:
-        st.error(f"Image Generation Error: {str(e)}")
-        return None
-
-def save_config(config_name, config_data):
-    config_path = f"configs/{config_name}.json"
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, 'w') as f:
-        json.dump(config_data, f, indent=4)
-    st.success(f"Configuration saved as {config_name}.json")
-
-def load_config(config_name):
-    config_path = f"configs/{config_name}.json"
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            return json.load(f)
-    else:
-        st.error(f"Configuration file {config_name}.json not found.")
-        return None
-
-def get_saved_configs():
-    config_dir = "configs"
-    if not os.path.exists(config_dir):
-        return []
-    return [f for f in os.listdir(config_dir) if f.endswith('.json')]
-
 # Streamlit UI
-st.title("AI Crypto Meme Tweet Generator")
-st.write("This app automatically uses AI to generate meme tweets based on the most suitable current trend")
+def main():
+    st.title("🚀 AI Crypto Meme Generator Pro")
+    st.write("Creating viral crypto memes using real-time trends!")
 
-# Sidebar Configuration
-with st.sidebar:
-    st.header("Configuration")
-
-    # Meme Token Configuration
-    with st.expander("Meme Token Settings", expanded=True):
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("Token Configuration")
         token_name = st.text_input("Token Name", DEFAULT_TOKEN_NAME)
         token_description = st.text_area("Token Description", DEFAULT_TOKEN_DESCRIPTION)
-        image_description = st.text_area(
-            "Image Description",
-            DEFAULT_IMAGE_DESCRIPTION,
-            help="Describe the image to be generated that will accompany the tweet."
-        )
+        image_description = st.text_area("Image Style", DEFAULT_IMAGE_DESCRIPTION)
 
-    # Advanced Configuration
-    with st.expander("Advanced Settings"):
-        prompt = st.text_area("Prompt Template", DEFAULT_PROMPT)
+        st.markdown("---")
+        st.markdown("""
+        💡 **Tips:**
+        - Keep token name memorable
+        - Description should be clear
+        - Image style guides the AI
+        """)
 
-    # Configuration Management
-    with st.expander("Configuration Management"):
-        config_name = st.text_input("Configuration Name")
-        if st.button("Save Configuration"):
-            config_data = {
-                "token_name": token_name,
-                "token_description": token_description,
-                "image_description": image_description,
-                "prompt": prompt
-            }
-            save_config(config_name, config_data)
+    # Main content
+    if st.button("✨ Generate Viral Meme", use_container_width=True):
+        if not (token_name and token_description):
+            st.error("Please fill in token details first!")
+            return
 
-        saved_configs = get_saved_configs()
-        selected_config = st.selectbox("Load Configuration", saved_configs)
-        if st.button("Load Configuration"):
-            if selected_config:
-                config_data = load_config(selected_config.replace('.json', ''))
-                if config_data:
-                    token_name = config_data.get("token_name", DEFAULT_TOKEN_NAME)
-                    token_description = config_data.get("token_description", DEFAULT_TOKEN_DESCRIPTION)
-                    image_description = config_data.get("image_description", DEFAULT_IMAGE_DESCRIPTION)
-                    prompt = config_data.get("prompt", DEFAULT_PROMPT)
-
-# 主要生成按钮
-if st.button("🚀 AI Generate Meme Tweet"):
-    if token_name and token_description:
-        # 创建进度显示区域
-        status_container = st.empty()
-        result_container = st.container()
-
-        with result_container:
-            # 1. 获取最新趋势
-            status_container.info("🔍 AI Fetching latest trends...")
+        with st.spinner("🔍 AI Analyzing trends..."):
+            # 1. 获取趋势
             trends = get_latest_global_trends()
             if not trends:
-                st.error("Failed to fetch trends. Please try again.")
-                st.stop()
+                st.error("Couldn't fetch trends. Please try again.")
+                return
 
-            st.subheader("AI Search Trending Topics")
-            st.write(", ".join(trends))
+            # 显示所有趋势
+            with st.expander("📊 Current Trends"):
+                for trend in trends:
+                    st.write(f"- {trend['original']}")
 
-            # 2. AI 选择趋势
-            status_container.info("🤔 AI is selecting the most suitable trend...")
-            selected_trend, trend_explanation = select_best_trend(trends, token_name, token_description)
-
-            st.subheader("AI Select Trend")
-            st.write(f"AI Selected Trend: **{selected_trend}**")
-            st.write("Why this trend?")
-            st.write(trend_explanation)
-
-            # 3. 生成推文
-            status_container.info("✍️ AI Generating tweet...")
-            tweet = generate_meme_tweet(
-                token_name,
-                token_description,
-                trends,
-                prompt
+            # 2. 选择最佳趋势
+            trend, explanation, context = select_best_trend(
+                trends, token_name, token_description
             )
 
-        if tweet:
-            st.subheader("AI Generated Tweet")
-            st.write(tweet)
+            st.subheader("🎯 AI Selected Trend")
+            st.write(f"**{trend}**")
+            st.write(explanation)
 
-            # 4. 生成配图
-            status_container.info("🎨 Creating accompanying image...")
-            combined_image_prompt = f"{image_description}\n\nTweet Content: {tweet}"
-            image_url = generate_image_from_text(combined_image_prompt)
+            # 3. 生成Tweet
+            tweet = generate_meme_tweet(
+                token_name, token_description,
+                trend, context
+            )
 
-            if image_url:
-                st.subheader("AI Generated Image")
-                st.image(image_url, caption="Generated Meme Tweet Image")
+            if tweet:
+                st.subheader("📝 AI Generated Tweet")
+                st.code(tweet, language="text")
 
-                # 使用用户输入的认证信息
-                if 'client' in locals() and client:
-                    try:
-                        # 尝试发送推文
-                        response = client.create_tweet(text=tweet)
-                        tweet_id = response.data['id']
+                # 4. 生成配图
+                with st.spinner("🎨 Creating meme image..."):
+                    image_url = generate_image(tweet, image_description)
+                    if image_url:
+                        st.subheader("🖼️ Meme Image")
+                        st.image(image_url, caption="AI Generated Meme Image")
 
-                        # 显示成功信息
-                        st.success(f"Tweet posted successfully! Tweet ID: {tweet_id}")
-                        st.markdown(f"[View your tweet](https://twitter.com/user/status/{tweet_id})")
+                        # 提供下载选项
+                        st.markdown(f"[Download Image]({image_url})")
+                    else:
+                        st.error("Failed to generate image.")
 
-                        # 显示发推按钮
-                        col1, col2 = st.columns([1, 4])
-                        with col1:
-                            st.button("🐦 Post Another Tweet")
+                # 复制按钮
+                st.button("📋 Copy Tweet", on_click=lambda: st.write("Tweet copied!"))
 
-                    except Exception as e:
-                        # 显示错误信息
-                        st.error(f"Error posting tweet: {str(e)}")
-
-                        # 显示重试按钮
-                        col1, col2 = st.columns([1, 4])
-                        with col1:
-                            st.button("🔄 Retry Posting")
+                # 发推按钮
+                if 'client' in globals() and client:
+                    if st.button("🐦 Post Tweet to X", use_container_width=True):
+                        post_tweet(client, tweet)
                 else:
-                    st.error("Failed to authenticate with Twitter. Please check your credentials.")
+                    st.error("Please authenticate with Twitter first!")
             else:
-                st.error("Failed to generate image.")
+                st.error("Failed to generate tweet. Please try again.")
 
-            # 清除状态信息，显示完成消息
-            status_container.success("✨ AI Generation completed!")
-        else:
-            status_container.error("Failed to generate tweet. Please try again.")
-    else:
-        st.error("Please enter token information in the sidebar.")
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+        Made with ❤️ by AI
 
-# 添加页面底部说明
-st.markdown("---")
-st.markdown("""
-    💡 **How it works:**
-    1. AI Fetches real-time trending topics
-    2. AI selects the most suitable trend for your token
-    3. AI Generates an engaging tweet
-    4. AI Creates a matching image
-    5. Optionally post directly to X (Twitter)
+        **How it works:**
+        1. Real-time trend analysis
+        2. Smart trend selection
+        3. AI-powered content creation
+        4. Meme image generation
+    """)
 
-    Configure your token details in the sidebar to get started!
-""")
+if __name__ == "__main__":
+    main()
