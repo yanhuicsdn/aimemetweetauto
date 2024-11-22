@@ -77,18 +77,18 @@ DEFAULT_TOKEN_NAME = "LEGENDARY HUMANITY"
 DEFAULT_TOKEN_DESCRIPTION = "Merging fashion, art, and #AI into #Web3 assets. Empowering designers and artists with community-driven #meme coins. $VIVI is the governance token."
 DEFAULT_IMAGE_DESCRIPTION = "A vibrant and humorous illustration representing the essence of the tweet, with logo 'LEGENDARY HUMANITY' and 'VIVI'."
 
-# 保存 tokens 到本地存储
+# Save tokens to local storage
 def save_tokens_to_local_storage(tokens: Dict[str, str]) -> None:
     st.experimental_set_query_params(**tokens)
 
-# 从本地存储加载 tokens
+# Load tokens from local storage
 def load_tokens_from_local_storage() -> Optional[Dict[str, str]]:
     params = st.experimental_get_query_params()
     if params:
         return {key: params[key][0] for key in params}
     return None
 
-# 认证函数
+# Authentication function
 def authenticate_twitter(credentials: Dict[str, str]) -> Optional[tweepy.Client]:
     try:
         client = tweepy.Client(
@@ -103,7 +103,7 @@ def authenticate_twitter(credentials: Dict[str, str]) -> Optional[tweepy.Client]
         st.error(f"Authentication Error: {e}")
         return None
 
-# 加载现有 tokens
+# Load existing tokens
 tokens = load_tokens_from_local_storage()
 
 if tokens:
@@ -113,7 +113,7 @@ if tokens:
     else:
         st.error("Failed to authenticate with stored tokens.")
 else:
-    # 如果没有存储的 tokens，提示用户输入凭证
+    # If no stored tokens, prompt user for credentials
     st.sidebar.header("Twitter API Settings")
     consumer_key = st.sidebar.text_input("Consumer Key (API Key)", type="password")
     consumer_secret = st.sidebar.text_input("Consumer Secret (API Secret)", type="password")
@@ -133,34 +133,6 @@ else:
         if client:
             save_tokens_to_local_storage(credentials)
             st.success("Authenticated successfully and tokens saved!")
-        else:
-            st.error("Failed to authenticate with Twitter.")
-
-# 添加一个按钮来重新输入凭证
-if st.sidebar.button("Switch Twitter Account"):
-    st.session_state.switch_account = True
-
-if 'switch_account' in st.session_state and st.session_state.switch_account:
-    st.sidebar.header("Switch Twitter API Settings")
-    consumer_key = st.sidebar.text_input("Consumer Key (API Key)", type="password")
-    consumer_secret = st.sidebar.text_input("Consumer Secret (API Secret)", type="password")
-    access_token = st.sidebar.text_input("Access Token", type="password")
-    access_token_secret = st.sidebar.text_input("Access Token Secret", type="password")
-    bearer_token = st.sidebar.text_input("Bearer Token", type="password")
-
-    if st.sidebar.button("Authenticate New Account"):
-        credentials = {
-            'consumer_key': consumer_key,
-            'consumer_secret': consumer_secret,
-            'access_token': access_token,
-            'access_token_secret': access_token_secret,
-            'bearer_token': bearer_token
-        }
-        client = authenticate_twitter(credentials)
-        if client:
-            save_tokens_to_local_storage(credentials)
-            st.success("Authenticated successfully and tokens saved!")
-            st.session_state.switch_account = False
         else:
             st.error("Failed to authenticate with Twitter.")
 
