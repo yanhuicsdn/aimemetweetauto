@@ -288,8 +288,8 @@ def select_best_trend(trends: List[str], token_name: str, token_description: str
         "messages": [{"role": "user", "content": selection_prompt}],
         "stream": False,
         "max_tokens": 200,
-        "temperature": 0.3,
-        "response_format": {"type": "json_object"}
+        "temperature": 0.9,
+        "response_format": {"type": "text"}
     }
 
     try:
@@ -336,12 +336,12 @@ def generate_meme_tweet(token_name, token_description, trends, prompt):
         "stream": False,
         "max_tokens": 512,
         "stop": ["<string>"],
-        "temperature": 0.7,
+        "temperature": 0.9,
         "top_p": 0.7,
         "top_k": 50,
         "frequency_penalty": 0.5,
         "n": 1,
-        "response_format": {"type": "json_object"}
+        "response_format": {"type": "text"}
     }
 
     try:
